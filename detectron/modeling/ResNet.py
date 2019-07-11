@@ -26,7 +26,6 @@ from __future__ import unicode_literals
 from detectron.core.config import cfg
 from detectron.utils.net import get_group_gn
 
-
 # ---------------------------------------------------------------------------- #
 # Bits for specific architectures (ResNet50, ResNet101, ...)
 # ---------------------------------------------------------------------------- #
@@ -51,6 +50,8 @@ def add_ResNet101_conv5_body(model):
 def add_ResNet152_conv5_body(model):
     return add_ResNet_convX_body(model, (3, 8, 36, 3))
 
+def add_ResNet50_NLB_4_conv5_body(model):
+    return add_ResNet_NLB_convX_body(model, (3, 4, 6, 3), ('conv4'))
 
 # ---------------------------------------------------------------------------- #
 # Generic ResNet components
@@ -86,7 +87,6 @@ def add_stage(
         )
         dim_in = dim_out
     return blob_in, dim_in
-
 
 def add_ResNet_convX_body(model, block_counts):
     """Add a ResNet body from input data up through the res5 (aka conv5) stage.
@@ -125,6 +125,89 @@ def add_ResNet_convX_body(model, block_counts):
     else:
         return s, dim_in, 1. / 16.
 
+# --------------------Non-Local Block ----------------------- #
+def add_nlb_stage(
+        model,
+        prefix,
+        blob_in,
+        n,
+        dim_in,
+        dim_out,
+        dim_inner,
+        dilation,
+        stride_init=2
+):
+
+    for i in range(n):
+        # add nlb right before last block
+        if i == n - 1:
+            blob_in = add_nlb_block(
+                model,
+                '{}_{}'.format(prefix, 'NLB'),
+                blob_in,
+                dim_in,
+                dim_out,
+                dim_in//2
+            )
+
+        blob_in = add_residual_block(
+            model,
+            '{}_{}'.format(prefix, i),
+            blob_in,
+            dim_in,
+            dim_out,
+            dim_inner,
+            dilation,
+            stride_init,
+            inplace_sum=i < n - 1
+        )
+        dim_in = dim_out
+    return blob_in, dim_in
+
+def add_ResNet_NLB_convX_body(model, block_counts, nlb_layers):
+    """Add a ResNet body with NLB from input data up through the res5 (aka conv5) stage.
+    The final res5/conv5 stage may be optionally excluded (hence convX, where
+    X = 4 or 5)."""
+    freeze_at = cfg.TRAIN.FREEZE_AT
+    assert freeze_at in [0, 2, 3, 4, 5]
+
+    # add the stem (by default, conv1 and pool1 with bn; can support gn)
+    p, dim_in = globals()[cfg.RESNETS.STEM_FUNC](model, 'data')
+    dim_bottleneck = cfg.RESNETS.NUM_GROUPS * cfg.RESNETS.WIDTH_PER_GROUP
+    (n1, n2, n3) = block_counts[:3]
+    s, dim_in = add_stage(model, 'res2', p, n1, dim_in, 256, dim_bottleneck, 1)
+    if freeze_at == 2:
+        model.StopGradient(s, s)
+
+    s, dim_in = add_stage(
+        model, 'res3', s, n2, dim_in, 512, dim_bottleneck * 2, 1
+    )
+    if freeze_at == 3:
+        model.StopGradient(s, s)
+
+    if 'conv4' in nlb_layers:
+        s, dim_in = add_nlb_stage(
+            model, 'res4', s, n3, dim_in, 1024, dim_bottleneck * 4, 1
+        )
+    else:
+        s, dim_in = add_stage(
+            model, 'res4', s, n3, dim_in, 1024, dim_bottleneck * 4, 1
+        )
+    if freeze_at == 4:
+        model.StopGradient(s, s)
+
+    if len(block_counts) == 4:
+        n4 = block_counts[3]
+        s, dim_in = add_stage(
+            model, 'res5', s, n4, dim_in, 2048, dim_bottleneck * 8,
+            cfg.RESNETS.RES5_DILATION
+        )
+        if freeze_at == 5:
+            model.StopGradient(s, s)
+        return s, dim_in, 1. / 32. * cfg.RESNETS.RES5_DILATION
+    else:
+        return s, dim_in, 1. / 16.
+
 
 def add_ResNet_roi_conv5_head(model, blob_in, dim_in, spatial_scale):
     """Adds an RoI feature transformation (e.g., RoI pooling) followed by a
@@ -149,7 +232,6 @@ def add_ResNet_roi_conv5_head(model, blob_in, dim_in, spatial_scale):
     s = model.AveragePool(s, 'res5_pool', kernel=7)
     return s, 2048
 
-
 def add_residual_block(
     model,
     prefix,
@@ -162,10 +244,6 @@ def add_residual_block(
     inplace_sum=False
 ):
     """Add a residual block to the model."""
-    # prefix = res<stage>_<sub_stage>, e.g., res2_3
-
-    # Max pooling is performed prior to the first stage (which is uniquely
-    # distinguished by dim_in = 64), thus we keep stride = 1 for the first stage
     stride = stride_init if (
         dim_in != dim_out and dim_in != 64 and dilation == 1
     ) else 1
@@ -183,8 +261,6 @@ def add_residual_block(
         dilation=dilation
     )
 
-    # sum -> ReLU
-    # shortcut function: by default using bn; support gn
     add_shortcut = globals()[cfg.RESNETS.SHORTCUT_FUNC]
     sc = add_shortcut(model, prefix, blob_in, dim_in, dim_out, stride)
     if inplace_sum:
@@ -194,6 +270,77 @@ def add_residual_block(
 
     return model.Relu(s, s)
 
+def add_nlb_block(model, prefix, blob_in, dim_in, dim_out, dim_inner):
+    blob_out = spatial_nonlocal(model, prefix, blob_in, dim_in, dim_out, dim_inner)
+    return blob_out
+
+
+
+def spatial_nonlocal(model, prefix, blob_in, dim_in, dim_out, dim_inner):
+    '''
+    Embedded Gaussian Implementation
+    :param model:
+    :param prefix:
+    :param blob_in:
+    :param dim_in:
+    :param dim_out:
+    :param dim_inner:
+    :return:
+    '''
+
+    cur = blob_in
+    theta = model.ConvNd(
+        cur, prefix + '_theta',
+        dim_in,
+        dim_inner,
+        [1, 1],
+        strides=[1, 1],
+        pads=[0, 0] * 2,
+        weight_init=('GaussianFill', {'std': 0.1}),
+        bias_init=('ConstantFill', {'value': 0.}), no_bias=0
+    )
+
+    phi = model.ConvNd(
+        cur, prefix + '_phi',
+        dim_in,
+        dim_inner,
+        [1, 1],
+        strides=[1, 1],
+        pads=[0, 0] * 2,
+        weight_init=('GaussianFill', {'std': 0.1}),
+        bias_init=('ConstantFill', {'value': 0.}), no_bias=0
+    )
+
+    g = model.ConvNd(
+        cur, prefix + '_g',
+        dim_in,
+        dim_inner,
+        [1, 1],
+        strides=[1, 1],
+        pads=[0, 0] * 2,
+        weight_init=('GaussianFill', {'std': 0.1}),
+        bias_init=('ConstantFill', {'value': 0.}), no_bias=0
+    )
+
+    theta_phi = model.net.BatchMatMul([theta, phi], prefix + '_affinity', trans_a=1)
+    theta_phi_sc = model.Scale(theta_phi, theta_phi, scale=dim_inner ** -.5)
+    p = model.Softmax(theta_phi_sc, theta_phi + '_prob', engine='CUDNN', axis=1)
+    t = model.net.BatchMatMul([g, p], prefix + '_y', trans_b=1)
+
+    blob_out = model.ConvNd(
+        t, prefix + '_out',
+        dim_inner,
+        dim_out,
+        [1, 1],
+        strides=[1, 1],
+        pads=[0, 0] * 2,
+        weight_init=('GaussianFill', {'std': 0.1}),
+        bias_init=('ConstantFill', {'value': 0.}), no_bias=0
+    )
+
+    blob_out = model.net.Sum([blob_in, blob_out], prefix + '_sum')
+
+    return blob_out
 
 # ------------------------------------------------------------------------------
 # various shortcuts (may expand and may consider a new helper)

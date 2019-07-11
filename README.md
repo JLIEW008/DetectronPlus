@@ -1,3 +1,13 @@
+# DetectronPlus
+
+Implementing additional functionalities to Detectron.
+
+Current Implmentations:
+- [Non-Local Block](https://arxiv.org/pdf/1711.07971.pdf) - embedded gaussian for spatial data (E.g. COCO)
+To run, change config MODEL.CONV_BODY: FPN.add_fpn_NLB_ResNet50_conv5_body
+Currently, the NLBlock is only added to ResNet-50 to try to recreate the results published in the paper (COCO). The code is added directly into ResNet.py, and if the results from the paper can be recreated, I will move on to add other versions and refactor the code.
+If you have already setup Detectron, you can replace your detectron/modeling/ResNet.py with the one in this repo. 
+
 # Detectron
 
 Detectron is Facebook AI Research's software system that implements state-of-the-art object detection algorithms, including [Mask R-CNN](https://arxiv.org/abs/1703.06870). It is written in Python and powered by the [Caffe2](https://github.com/caffe2/caffe2) deep learning framework.
